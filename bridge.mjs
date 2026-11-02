@@ -143,7 +143,13 @@ function openStream(target, onData, onError, onClose) {
         ? { 'Proxy-Authorization': 'Basic ' + Buffer.from(decodeURIComponent(v.username) + ':' + decodeURIComponent(v.password)).toString('base64') }
         : {},
     });
-    req.on('connect', (res, sock) => attach(sock));
+    req.on('connect', (res, sock) => {
+      if (PLAIN) { attach(sock); return; }
+      // wss:// over the forward proxy still needs TLS on top of the CONNECT tunnel
+      const t = tls.connect({ socket: sock, servername: HOST, ALPNProtocols: ['http/1.1'] });
+      t.once('error', (e) => { dbg('tls over via failed', e.message); onError(e); });
+      t.once('secureConnect', () => attach(t));
+    });
     req.on('error', onError);
     req.end();
   } else {
@@ -204,4 +210,61 @@ net.createServer((conn) => {
     (VIA ? '  via ' + VIA : ''));
 });
 
+// ---------- local HTTP proxy (CONNECT + absolute-URI) on HTTP_LISTEN ----------
+
+const HTTP_LISTEN = Number(arg('http-listen', 0));
+
+if (HTTP_LISTEN) {
+  net.createServer((conn) => {
+    conn.on('error', () => {});
+    let buf = Buffer.alloc(0);
+    const onHead = (chunk) => {
+      buf = Buffer.concat([buf, chunk]);
+      const end = buf.indexOf('\r\n\r\n');
+      if (end < 0) { if (buf.length > 8192) conn.destroy(); return; }
+      conn.removeListener('data', onHead);
+      const head = buf.subarray(0, end).toString('latin1');
+      const rest = buf.subarray(end + 4);
+      const lines = head.split('\r\n');
+      const m = /^([A-Z]+)\s+(\S+)\s+HTTP\/1\.[01]$/.exec(lines[0] || '');
+      if (!m) { conn.end('HTTP/1.1 400 Bad Request\r\n\r\n'); return; }
+      const method = m[1];
+      const target = m[2];
+
+      let host, port, requestHead;
+      if (method === 'CONNECT') {
+        const p = target.split(':');
+        host = p[0];
+        port = Number(p[1] || 443);
+        requestHead = null;
+      } else if (/^https?:\/\//i.test(target)) {
+        const u = new URL(target);
+        host = u.hostname;
+        port = Number(u.port || (u.protocol === 'https:' ? 443 : 80));
+        const restHeaders = lines.slice(1).filter((l) => !/^proxy-connection:/i.test(l));
+        requestHead = Buffer.from(
+          method + ' ' + (u.pathname + u.search || '/') + ' HTTP/1.1\r\n' + restHeaders.join('\r\n') + '\r\n\r\n'
+        );
+      } else {
+        conn.end('HTTP/1.1 400 Bad Request\r\n\r\n');
+        return;
+      }
+
+      openStream({ host, port },
+        (d) => { try { conn.write(d); } catch (e) {} },
+        () => { try { conn.end('HTTP/1.1 502 Bad Gateway\r\n\r\n'); } catch (e) {} },
+        () => { try { conn.destroy(); } catch (e) {} }
+      ).then((s) => {
+        if (method === 'CONNECT') { conn.write('HTTP/1.1 200 Connection Established\r\n\r\n'); }
+        else if (requestHead) s.write(requestHead);
+        if (rest.length) s.write(rest);
+        conn.on('data', (d) => s.write(d));
+        conn.on('close', () => s.destroy());
+      });
+    };
+    conn.on('data', onHead);
+  }).listen(HTTP_LISTEN, '127.0.0.1', () => {
+    console.log('local http proxy 127.0.0.1:' + HTTP_LISTEN);
+  });
+}
 
