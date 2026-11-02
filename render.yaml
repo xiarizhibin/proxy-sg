@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: proxy-sg
+    runtime: node
+    plan: free
+    region: singapore
+    branch: master
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /__health
+    envVars:
+      - key: PROXY_USER
+        sync: false
+      - key: PROXY_PASS
+        sync: false
+      - key: ENABLE_TUNNEL
+        value: "true"
+      - key: NODE_VERSION
+        value: "22"
