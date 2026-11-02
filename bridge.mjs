@@ -40,6 +40,7 @@ const PASS = String(arg('pass', process.env.PROXY_PASS || 'proxypass'));
 const PATH = String(arg('path', '/__tunnel'));
 const VIA = arg('via', null);
 const PLAIN = arg('plain', false) === true;   // ws:// instead of wss:// (local tests only)
+const SNI = String(arg('sni', HOST));         // TLS SNI + Host header; set when --host is a raw IP
 const DEBUG = process.env.DEBUG_BRIDGE === '1';
 const dbg = (...a) => { if (DEBUG) console.error('[bridge]', ...a); };
 
@@ -93,7 +94,7 @@ function wsUpgrade(sock, cb) {
   const key = crypto.randomBytes(16).toString('base64');
   sock.write(
     'GET ' + PATH + ' HTTP/1.1\r\n' +
-    'Host: ' + HOST + ':' + PORT + '\r\n' +
+    'Host: ' + SNI + '\r\n' +
     'Upgrade: websocket\r\nConnection: Upgrade\r\n' +
     'Sec-WebSocket-Key: ' + key + '\r\nSec-WebSocket-Version: 13\r\n\r\n'
   );
@@ -112,14 +113,39 @@ function wsUpgrade(sock, cb) {
 
 // ---------- one tunnelled stream ----------
 
-function openStream(target, onData, onError, onClose) {
-  const attach = (sock, leftover) => {
+// The first tunnel after an idle period often dies while the free instance is
+// still waking up, so every transport attempt is retried (default 3).
+const ATTEMPTS = Number(arg('attempts', 3));
+
+function openStream(target, onData, onError, onClose, attempt) {
+  const n = attempt || 1;
+  let settled = false;
+  let onOpen = () => {};
+  const ready = new Promise((resolve) => { onOpen = resolve; });
+
+  const retryOrFail = (why) => {
+    if (settled) return;
+    settled = true;
+    if (n < ATTEMPTS) {
+      dbg('retry ' + n + '/' + ATTEMPTS + ' (' + why + ')');
+      setTimeout(() => {
+        const again = openStream(target, onData, onError, onClose, n + 1);
+        again.then((s) => onOpen(s));
+      }, 350);
+      return;
+    }
+    onError(new Error(why));
+  };
+
+  const attach = (sock) => {
     sock.setNoDelay(true);
     wsUpgrade(sock, (err, rest) => {
-      if (err) { dbg('upgrade failed', err.message); onError(err); try { sock.destroy(); } catch (e) {} return; }
+      if (err) { try { sock.destroy(); } catch (e) {} retryOrFail('upgrade: ' + err.message); return; }
+      if (settled) { try { sock.destroy(); } catch (e) {} return; }
+      settled = true;
       dbg('ws upgraded');
       sock.write(wsFrame(Buffer.from(JSON.stringify({ u: USER, p: PASS, host: target.host, port: target.port })), 0x1));
-      const parse = wsParser((p) => onData(p), onClose);
+      const parse = wsParser(onData, onClose);
       if (rest && rest.length) parse(rest);
       sock.on('data', parse);
       sock.on('close', onClose);
@@ -131,37 +157,32 @@ function openStream(target, onData, onError, onClose) {
     });
   };
 
-  let onOpen = () => {};
-  const ready = new Promise((resolve) => { onOpen = resolve; });
-
   if (VIA) {
     const v = new URL(VIA);
     const req = http.request({
       host: v.hostname, port: Number(v.port || 80), method: 'CONNECT',
-      path: HOST + ':' + PORT, family: 4,
+      path: SNI + ':' + PORT, family: 4,
       headers: v.username
         ? { 'Proxy-Authorization': 'Basic ' + Buffer.from(decodeURIComponent(v.username) + ':' + decodeURIComponent(v.password)).toString('base64') }
         : {},
     });
     req.on('connect', (res, sock) => {
       if (PLAIN) { attach(sock); return; }
-      // wss:// over the forward proxy still needs TLS on top of the CONNECT tunnel
-      const t = tls.connect({ socket: sock, servername: HOST, ALPNProtocols: ['http/1.1'] });
-      t.once('error', (e) => { dbg('tls over via failed', e.message); onError(e); });
+      const t = tls.connect({ socket: sock, servername: SNI, ALPNProtocols: ['http/1.1'] });
+      t.once('error', (e) => { try { t.destroy(); } catch (e2) {} retryOrFail('tls-via: ' + e.message); });
       t.once('secureConnect', () => attach(t));
     });
-    req.on('error', onError);
+    req.on('error', (e) => retryOrFail('via: ' + e.message));
     req.end();
   } else {
     const sock = PLAIN
       ? net.connect({ host: HOST, port: PORT, family: 4 })
-      : tls.connect({ host: HOST, port: PORT, servername: HOST, family: 4, ALPNProtocols: ['http/1.1'] });
-    sock.once('error', (e) => { dbg('sock error', e.message); onError(e); });
+      : tls.connect({ host: HOST, port: PORT, servername: SNI, family: 4, ALPNProtocols: ['http/1.1'] });
+    sock.once('error', (e) => { try { sock.destroy(); } catch (e2) {} retryOrFail('sock: ' + e.message); });
     sock.once(PLAIN ? 'connect' : 'secureConnect', () => attach(sock));
   }
   return ready;
 }
-
 // ---------- local SOCKS5 server ----------
 
 net.createServer((conn) => {
@@ -206,7 +227,7 @@ net.createServer((conn) => {
     }
   });
 }).listen(LISTEN, '127.0.0.1', () => {
-  console.log('local socks5 127.0.0.1:' + LISTEN + '  ->  wss://' + HOST + ':' + PORT + PATH +
+  console.log('local socks5 127.0.0.1:' + LISTEN + '  ->  wss://' + SNI + ':' + PORT + PATH + '  (dial ' + HOST + ')' +
     (VIA ? '  via ' + VIA : ''));
 });
 
@@ -267,4 +288,8 @@ if (HTTP_LISTEN) {
     console.log('local http proxy 127.0.0.1:' + HTTP_LISTEN);
   });
 }
+
+
+
+
 
